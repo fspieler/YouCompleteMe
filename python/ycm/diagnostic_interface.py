@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-#
 # Copyright (C) 2013  Google Inc.
 #
 # This file is part of YouCompleteMe.
@@ -17,14 +15,24 @@
 # You should have received a copy of the GNU General Public License
 # along with YouCompleteMe.  If not, see <http://www.gnu.org/licenses/>.
 
+from __future__ import unicode_literals
+from __future__ import print_function
+from __future__ import division
+from __future__ import absolute_import
+# Not installing aliases from python-future; it's unreliable and slow.
+from builtins import *  # noqa
+
+from future.utils import itervalues, iteritems
 from collections import defaultdict, namedtuple
 from ycm import vimsupport
+from ycm.diagnostic_filter import DiagnosticFilter, CompileLevel
 import vim
 
 
 class DiagnosticInterface( object ):
   def __init__( self, user_options ):
     self._user_options = user_options
+    self._diag_filter = DiagnosticFilter.CreateFromOptions( user_options )
     # Line and column numbers are 1-based
     self._buffer_number_to_line_to_diags = defaultdict(
       lambda: defaultdict( list ) )
@@ -44,8 +52,23 @@ class DiagnosticInterface( object ):
         self._EchoDiagnosticForLine( line )
 
 
+  def GetErrorCount( self ):
+    return len( self._FilterDiagnostics( _DiagnosticIsError ) )
+
+
+  def GetWarningCount( self ):
+    return len( self._FilterDiagnostics( _DiagnosticIsWarning ) )
+
+
+  def PopulateLocationList( self, diags ):
+    vimsupport.SetLocationList(
+      vimsupport.ConvertDiagnosticsToQfList(
+          self._ApplyDiagnosticFilter( diags ) ) )
+
+
   def UpdateWithNewDiagnostics( self, diags ):
-    normalized_diags = [ _NormalizeDiagnostic( x ) for x in diags ]
+    normalized_diags = [ _NormalizeDiagnostic( x ) for x in
+            self._ApplyDiagnosticFilter( diags ) ]
     self._buffer_number_to_line_to_diags = _ConvertDiagListToDict(
         normalized_diags )
 
@@ -59,8 +82,20 @@ class DiagnosticInterface( object ):
       _UpdateSquiggles( self._buffer_number_to_line_to_diags )
 
     if self._user_options[ 'always_populate_location_list' ]:
-      vimsupport.SetLocationList(
-        vimsupport.ConvertDiagnosticsToQfList( normalized_diags ) )
+      self.PopulateLocationList( normalized_diags )
+
+
+  def _ApplyDiagnosticFilter( self, diags, extra_predicate = None ):
+    filetypes = vimsupport.CurrentFiletypes()
+    diag_filter = self._diag_filter.SubsetForTypes( filetypes )
+    predicate = diag_filter.IsAllowed
+    if extra_predicate is not None:
+      def Filter( diag ):
+        return extra_predicate( diag ) and diag_filter.IsAllowed( diag )
+
+      predicate = Filter
+
+    return filter( predicate, diags )
 
 
   def _EchoDiagnosticForLine( self, line_num ):
@@ -69,27 +104,46 @@ class DiagnosticInterface( object ):
     if not diags:
       if self._diag_message_needs_clearing:
         # Clear any previous diag echo
-        vimsupport.EchoText( '', False )
+        vimsupport.PostVimMessage( '', warning = False )
         self._diag_message_needs_clearing = False
       return
-    vimsupport.EchoTextVimWidth( diags[ 0 ][ 'text' ] )
+
+    first_diag = diags[ 0 ]
+    text = first_diag[ 'text' ]
+    if first_diag.get( 'fixit_available', False ):
+      text += ' (FixIt)'
+
+    vimsupport.PostVimMessage( text, warning = False, truncate = True )
     self._diag_message_needs_clearing = True
+
+
+  def _FilterDiagnostics( self, predicate ):
+    matched_diags = []
+    line_to_diags = self._buffer_number_to_line_to_diags[
+      vim.current.buffer.number ]
+
+    for diags in itervalues( line_to_diags ):
+      matched_diags.extend( list(
+        self._ApplyDiagnosticFilter( diags, predicate ) ) )
+    return matched_diags
 
 
 def _UpdateSquiggles( buffer_number_to_line_to_diags ):
   vimsupport.ClearYcmSyntaxMatches()
   line_to_diags = buffer_number_to_line_to_diags[ vim.current.buffer.number ]
 
-  for diags in line_to_diags.itervalues():
-    for diag in diags:
+  for diags in itervalues( line_to_diags ):
+    # Insert squiggles in reverse order so that errors overlap warnings.
+    for diag in reversed( diags ):
       location_extent = diag[ 'location_extent' ]
       is_error = _DiagnosticIsError( diag )
 
-      if location_extent[ 'start' ][ 'line_num' ] < 0:
+      if location_extent[ 'start' ][ 'line_num' ] <= 0:
         location = diag[ 'location' ]
         vimsupport.AddDiagnosticSyntaxMatch(
-            location[ 'line_num' ],
-            location[ 'column_num' ] )
+          location[ 'line_num' ],
+          location[ 'column_num' ],
+          is_error = is_error )
       else:
         vimsupport.AddDiagnosticSyntaxMatch(
           location_extent[ 'start' ][ 'line_num' ],
@@ -144,26 +198,27 @@ def _GetKeptAndNewSigns( placed_signs, buffer_number_to_line_to_diags,
                          next_sign_id ):
   new_signs = []
   kept_signs = []
-  for buffer_number, line_to_diags in buffer_number_to_line_to_diags.iteritems():
+  for buffer_number, line_to_diags in iteritems(
+                                            buffer_number_to_line_to_diags ):
     if not vimsupport.BufferIsVisible( buffer_number ):
       continue
 
-    for line, diags in line_to_diags.iteritems():
-      for diag in diags:
-        sign = _DiagSignPlacement( next_sign_id,
-                                   line,
-                                   buffer_number,
-                                   _DiagnosticIsError( diag ) )
-        if sign not in placed_signs:
-          new_signs += [ sign ]
-          next_sign_id += 1
-        else:
-          # We use .index here because `sign` contains a new id, but
-          # we need the sign with the old id to unplace it later on.
-          # We won't be placing the new sign.
-          kept_signs += [ placed_signs[ placed_signs.index( sign ) ] ]
+    for line, diags in iteritems( line_to_diags ):
+      # Only one sign is visible by line.
+      first_diag = diags[ 0 ]
+      sign = _DiagSignPlacement( next_sign_id,
+                                 line,
+                                 buffer_number,
+                                 _DiagnosticIsError( first_diag ) )
+      if sign not in placed_signs:
+        new_signs.append( sign )
+        next_sign_id += 1
+      else:
+        # We use .index here because `sign` contains a new id, but
+        # we need the sign with the old id to unplace it later on.
+        # We won't be placing the new sign.
+        kept_signs.append( placed_signs[ placed_signs.index( sign ) ] )
   return new_signs, kept_signs, next_sign_id
-
 
 
 def _PlaceNewSigns( kept_signs, new_signs ):
@@ -174,7 +229,7 @@ def _PlaceNewSigns( kept_signs, new_signs ):
     if sign in placed_signs:
       continue
     vimsupport.PlaceSign( sign.id, sign.line, sign.buffer, sign.is_error )
-    placed_signs.append(sign)
+    placed_signs.append( sign )
   return placed_signs
 
 
@@ -193,17 +248,17 @@ def _ConvertDiagListToDict( diag_list ):
     line_number = location[ 'line_num' ]
     buffer_to_line_to_diags[ buffer_number ][ line_number ].append( diag )
 
-  for line_to_diags in buffer_to_line_to_diags.itervalues():
-    for diags in line_to_diags.itervalues():
-      # We also want errors to be listed before warnings so that errors aren't
-      # hidden by the warnings; Vim won't place a sign oven an existing one.
-      diags.sort( key = lambda diag: ( diag[ 'location' ][ 'column_num' ],
-                                       diag[ 'kind' ] ) )
+  for line_to_diags in itervalues( buffer_to_line_to_diags ):
+    for diags in itervalues( line_to_diags ):
+      # We want errors to be listed before warnings so that errors aren't hidden
+      # by the warnings.
+      diags.sort( key = lambda diag: ( diag[ 'kind' ],
+                                       diag[ 'location' ][ 'column_num' ] ) )
   return buffer_to_line_to_diags
 
 
-def _DiagnosticIsError( diag ):
-  return diag[ 'kind' ] == 'ERROR'
+_DiagnosticIsError = CompileLevel( 'error' )
+_DiagnosticIsWarning = CompileLevel( 'warning' )
 
 
 def _NormalizeDiagnostic( diag ):
@@ -216,8 +271,9 @@ def _NormalizeDiagnostic( diag ):
   return diag
 
 
-class _DiagSignPlacement( namedtuple( "_DiagSignPlacement",
-                                      [ 'id', 'line', 'buffer', 'is_error' ] ) ):
+class _DiagSignPlacement(
+                    namedtuple( "_DiagSignPlacement",
+                                [ 'id', 'line', 'buffer', 'is_error' ] ) ):
   # We want two signs that have different ids but the same location to compare
   # equal. ID doesn't matter.
   def __eq__( self, other ):

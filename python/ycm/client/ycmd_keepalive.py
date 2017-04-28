@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-#
 # Copyright (C) 2013  Google Inc.
 #
 # This file is part of YouCompleteMe.
@@ -17,9 +15,16 @@
 # You should have received a copy of the GNU General Public License
 # along with YouCompleteMe.  If not, see <http://www.gnu.org/licenses/>.
 
+from __future__ import unicode_literals
+from __future__ import print_function
+from __future__ import division
+from __future__ import absolute_import
+# Not installing aliases from python-future; it's unreliable and slow.
+from builtins import *  # noqa
+
 import time
 from threading import Thread
-from ycm.client.base_request import BaseRequest
+from ycm.client.base_request import BaseRequest, HandleServerException
 
 
 # This class can be used to keep the ycmd server alive for the duration of the
@@ -40,9 +45,5 @@ class YcmdKeepalive( object ):
     while True:
       time.sleep( self._ping_interval_seconds )
 
-      # We don't care if there's an intermittent problem in contacting the
-      # server; it's fine to just skip this ping.
-      try:
+      with HandleServerException( display = False ):
         BaseRequest.GetDataFromHandler( 'healthy' )
-      except:
-        pass
